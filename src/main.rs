@@ -48,8 +48,10 @@ fn main() {
     cmd.env("ANTHROPIC_BASE_URL", &base_url);
     cmd.env("ANTHROPIC_AUTH_TOKEN", "sk-any");
     cmd.env("ANTHROPIC_API_KEY", "");
-    // agent CLI expects `auto`, not `cursor-auto`.
+    // agent CLI expects `auto`. Claude Code does not recognize that id, so we
+    // also declare modelOverrides / max context (see Anthropic model-config docs).
     cmd.env("ANTHROPIC_MODEL", "auto");
+    cmd.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "200000");
     cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
 
     // Claude Code merges ~/.claude/settings.json `env` and can override process
@@ -58,10 +60,14 @@ fn main() {
         *a == "--settings" || a.starts_with("--settings=")
     });
     if !user_passed_settings {
+        // modelOverrides: treat gateway id `auto` as a known Claude model so the
+        // "isn't recognized · context assumed 200k" warning goes away.
         let bridge_settings = format!(
             concat!(
                 r#"{{"env":{{"ANTHROPIC_BASE_URL":"{}","ANTHROPIC_AUTH_TOKEN":"sk-any","#,
-                r#""ANTHROPIC_API_KEY":"","ANTHROPIC_MODEL":"auto"}},"model":"auto"}}"#
+                r#""ANTHROPIC_API_KEY":"","ANTHROPIC_MODEL":"auto","#,
+                r#""CLAUDE_CODE_MAX_CONTEXT_TOKENS":"200000"}},"#,
+                r#""model":"auto","modelOverrides":{{"claude-sonnet-4-5":"auto"}}}}"#
             ),
             base_url
         );
@@ -516,7 +522,8 @@ impl TextStream {
 
 fn map_agent_model(requested: &str) -> &str {
     match requested {
-        "cursor-auto" | "default" | "claude-auto" => "auto",
+        "auto" | "cursor-auto" | "default" | "claude-auto" | "sonnet" | "opus" | "haiku" => "auto",
+        other if other.starts_with("claude-") => "auto",
         other => other,
     }
 }

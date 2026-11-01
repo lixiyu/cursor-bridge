@@ -48,8 +48,10 @@ fn main() {
     cmd.env("ANTHROPIC_BASE_URL", &base_url);
     cmd.env("ANTHROPIC_AUTH_TOKEN", "sk-any");
     cmd.env("ANTHROPIC_API_KEY", "");
-    // agent CLI expects `auto`. Claude Code does not recognize that id, so we
-    // also declare modelOverrides / max context (see Anthropic model-config docs).
+    // agent CLI expects `auto`. Claude Code doesn't know that id; for custom
+    // spellings (no `claude-` prefix) CLAUDE_CODE_MAX_CONTEXT_TOKENS sets the
+    // window and clears the "isn't recognized · assumed 200k" warning — without
+    // pinning a Sonnet version that will rot.
     cmd.env("ANTHROPIC_MODEL", "auto");
     cmd.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "200000");
     cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
@@ -60,14 +62,11 @@ fn main() {
         *a == "--settings" || a.starts_with("--settings=")
     });
     if !user_passed_settings {
-        // modelOverrides: treat gateway id `auto` as a known Claude model so the
-        // "isn't recognized · context assumed 200k" warning goes away.
         let bridge_settings = format!(
             concat!(
                 r#"{{"env":{{"ANTHROPIC_BASE_URL":"{}","ANTHROPIC_AUTH_TOKEN":"sk-any","#,
                 r#""ANTHROPIC_API_KEY":"","ANTHROPIC_MODEL":"auto","#,
-                r#""CLAUDE_CODE_MAX_CONTEXT_TOKENS":"200000"}},"#,
-                r#""model":"auto","modelOverrides":{{"claude-sonnet-4-5":"auto"}}}}"#
+                r#""CLAUDE_CODE_MAX_CONTEXT_TOKENS":"200000"}},"model":"auto"}}"#
             ),
             base_url
         );

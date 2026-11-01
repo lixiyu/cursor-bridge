@@ -48,30 +48,18 @@ fn main() {
     cmd.env("ANTHROPIC_BASE_URL", &base_url);
     cmd.env("ANTHROPIC_AUTH_TOKEN", "sk-any");
     cmd.env("ANTHROPIC_API_KEY", "");
-    // agent CLI expects `auto`. Claude Code doesn't know that id; for custom
-    // spellings (no `claude-` prefix) CLAUDE_CODE_MAX_CONTEXT_TOKENS sets the
-    // window and clears the "isn't recognized · assumed 200k" warning — without
-    // pinning a Sonnet version that will rot.
-    cmd.env("ANTHROPIC_MODEL", "auto");
-    cmd.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "200000");
+    // Claude Code speaks stable Anthropic aliases (`sonnet`/`opus`/`haiku`).
+    // Those aliases track current Claude Code releases; we map them to Cursor
+    // `auto` only when spawning `agent` (see map_agent_model). Do not expose
+    // Cursor's `auto` id to Claude Code — it is unrecognized there.
+    cmd.env("ANTHROPIC_MODEL", "sonnet");
     cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
 
-    // Claude Code merges ~/.claude/settings.json `env` and can override process
-    // env (e.g. a custom DeepSeek base URL). Force the local proxy via --settings.
-    let user_passed_settings = claude_args.iter().any(|a| {
-        *a == "--settings" || a.starts_with("--settings=")
-    });
-    if !user_passed_settings {
-        let bridge_settings = format!(
-            concat!(
-                r#"{{"env":{{"ANTHROPIC_BASE_URL":"{}","ANTHROPIC_AUTH_TOKEN":"sk-any","#,
-                r#""ANTHROPIC_API_KEY":"","ANTHROPIC_MODEL":"auto","#,
-                r#""CLAUDE_CODE_MAX_CONTEXT_TOKENS":"200000"}},"model":"auto"}}"#
-            ),
-            base_url
-        );
-        cmd.arg("--settings").arg(bridge_settings);
-    }
+    // Isolate from ~/.claude/settings.json (often pins DeepSeek / custom
+    // ANTHROPIC_DEFAULT_*_MODEL that hijack the `sonnet` alias). A private
+    // CLAUDE_CONFIG_DIR is the durable fix — not version pins or max-token hacks.
+    let config_dir = bridge_config_dir(&base_url);
+    cmd.env("CLAUDE_CONFIG_DIR", &config_dir);
 
     for arg in &claude_args { cmd.arg(arg); }
     cmd.stdin(Stdio::inherit());
@@ -107,6 +95,33 @@ fn get_cursor_token() -> String {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => String::new(),
     }
+}
+
+/// Private Claude Code config so user DeepSeek/custom settings cannot leak in.
+fn bridge_config_dir(base_url: &str) -> std::path::PathBuf {
+    let tmp = std::env::var_os("TMPDIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let dir = tmp.join(format!("cursor-bridge-claude-config-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let settings = format!(
+        concat!(
+            "{{\n",
+            "  \"model\": \"sonnet\",\n",
+            "  \"env\": {{\n",
+            "    \"ANTHROPIC_BASE_URL\": \"{base}\",\n",
+            "    \"ANTHROPIC_AUTH_TOKEN\": \"sk-any\",\n",
+            "    \"ANTHROPIC_API_KEY\": \"\",\n",
+            "    \"ANTHROPIC_MODEL\": \"sonnet\"\n",
+            "  }}\n",
+            "}}\n"
+        ),
+        base = base_url
+    );
+    let _ = std::fs::write(dir.join("settings.json"), settings);
+    log(&format!("claude config: {}", dir.display()));
+    dir
 }
 
 // ─── Proxy ────────────────────────────────────────────────────
@@ -218,9 +233,12 @@ fn respond_models(mut s: TcpStream) {
 }
 
 fn get_models_json() -> String {
+    // Anthropic aliases first so Claude Code's picker/context logic stays happy.
+    // Cursor-native ids are also listed and passed through to `agent` unchanged.
     r#"{"data":[
-        {"type":"model","id":"auto","display_name":"Auto"},
-        {"type":"model","id":"default","display_name":"Auto"},
+        {"type":"model","id":"sonnet","display_name":"Cursor Auto"},
+        {"type":"model","id":"opus","display_name":"Cursor Auto (opus)"},
+        {"type":"model","id":"haiku","display_name":"Cursor Auto (haiku)"},
         {"type":"model","id":"composer-2.5","display_name":"Composer 2.5"},
         {"type":"model","id":"composer-2.5-fast","display_name":"Composer 2.5 Fast"},
         {"type":"model","id":"cursor-grok-4.5-high","display_name":"Cursor Grok 4.5"},
@@ -519,9 +537,12 @@ impl TextStream {
     }
 }
 
+/// Map the Anthropic-facing model id Claude Code sent → Cursor `agent --model`.
+/// Stable Anthropic aliases / Claude ids become Cursor Auto; Cursor-native ids pass through.
 fn map_agent_model(requested: &str) -> &str {
-    match requested {
-        "auto" | "cursor-auto" | "default" | "claude-auto" | "sonnet" | "opus" | "haiku" => "auto",
+    let base = requested.split(['[', '@']).next().unwrap_or(requested);
+    match base {
+        "sonnet" | "opus" | "haiku" | "auto" | "cursor-auto" | "default" | "claude-auto" => "auto",
         other if other.starts_with("claude-") => "auto",
         other => other,
     }
@@ -571,7 +592,7 @@ fn write_prompt(agent: &mut std::process::Child, prompt: &str) {
 
 fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
     let messages = req.messages.as_deref().unwrap_or_default();
-    let model = req.model.as_deref().unwrap_or("auto");
+    let model = req.model.as_deref().unwrap_or("sonnet");
     let (resume, prompt) = match plan_turn(&sessions().lock().unwrap(), messages, &req.system, model) {
         TurnPlan::Fresh { prompt } => (None, prompt),
         TurnPlan::Resume { chat_id, prompt } => (Some(chat_id), prompt),
@@ -662,7 +683,7 @@ fn emit_text(stream: &mut TcpStream, text: &str, index: i32, block_open: &mut bo
 
 fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let messages = req.messages.as_deref().unwrap_or_default();
-    let model = req.model.as_deref().unwrap_or("auto");
+    let model = req.model.as_deref().unwrap_or("sonnet");
     let (resume, prompt) = match plan_turn(&sessions().lock().unwrap(), messages, &req.system, model) {
         TurnPlan::Fresh { prompt } => (None, prompt),
         TurnPlan::Resume { chat_id, prompt } => (Some(chat_id), prompt),

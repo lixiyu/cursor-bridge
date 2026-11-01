@@ -822,8 +822,51 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let _ = agent.wait();
 }
 
+/// Escape raw control bytes inside JSON strings so serde_json can parse bodies
+/// that Claude Code sometimes emits (tool output / image sidecars / huge transcripts).
+fn escape_json_string_controls(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escape = false;
+    for &b in input {
+        if !in_string {
+            out.push(b);
+            if b == b'"' {
+                in_string = true;
+            }
+            continue;
+        }
+        if escape {
+            out.push(b);
+            escape = false;
+            continue;
+        }
+        match b {
+            b'\\' => {
+                out.push(b);
+                escape = true;
+            }
+            b'"' => {
+                out.push(b);
+                in_string = false;
+            }
+            0x00..=0x1F => {
+                // JSON strings cannot contain raw controls; emit \u00XX.
+                out.extend_from_slice(format!("\\u{b:04x}").as_bytes());
+            }
+            _ => out.push(b),
+        }
+    }
+    out
+}
+
 fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
-    let req: MessagesRequest = match serde_json::from_slice(body) {
+    let req: MessagesRequest = match serde_json::from_slice(body)
+        .or_else(|e| {
+            log(&format!("json parse retry after control-char sanitize: {e}"));
+            let cleaned = escape_json_string_controls(body);
+            serde_json::from_slice(&cleaned)
+        }) {
         Ok(r) => r,
         Err(e) => {
             let err = format!("{{\"error\":\"{}\"}}", e.to_string().replace('"', "'"));
@@ -860,6 +903,16 @@ mod tests {
         assert_eq!(strip_reminders("a<system-reminder>x</system-reminder>b"), "ab");
         assert_eq!(strip_reminders("plain"), "plain");
         assert_eq!(strip_reminders("keep<system-reminder>dangling"), "keep");
+    }
+
+    #[test]
+    fn test_escape_json_string_controls_makes_body_parseable() {
+        // Raw newline inside a JSON string is illegal; after sanitize it parses.
+        let bad = b"{\"model\":\"sonnet\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\nthere\"}]}";
+        assert!(serde_json::from_slice::<MessagesRequest>(bad).is_err());
+        let cleaned = escape_json_string_controls(bad);
+        let req: MessagesRequest = serde_json::from_slice(&cleaned).expect("cleaned json");
+        assert_eq!(req.model.as_deref(), Some("sonnet"));
     }
 
     #[test]

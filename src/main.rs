@@ -98,13 +98,14 @@ fn get_cursor_token() -> String {
 }
 
 /// Private Claude Code config so user DeepSeek/custom settings cannot leak in.
+/// Stable under ~/.cursor-bridge/claude so `/exit` session ids survive across runs.
 fn bridge_config_dir(base_url: &str) -> std::path::PathBuf {
-    let tmp = std::env::var_os("TMPDIR")
+    let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-    let dir = tmp.join(format!("cursor-bridge-claude-config-{}", std::process::id()));
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = home.join(".cursor-bridge").join("claude");
     let _ = std::fs::create_dir_all(&dir);
+    // Proxy port changes every launch; rewrite settings but keep projects/sessions.
     let settings = format!(
         concat!(
             "{{\n",

@@ -44,11 +44,29 @@ fn main() {
     };
 
     let mut cmd = Command::new("claude");
-    cmd.env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{}", proxy.port()));
+    let base_url = format!("http://127.0.0.1:{}", proxy.port());
+    cmd.env("ANTHROPIC_BASE_URL", &base_url);
     cmd.env("ANTHROPIC_AUTH_TOKEN", "sk-any");
     cmd.env("ANTHROPIC_API_KEY", "");
-    cmd.env("ANTHROPIC_MODEL", "cursor-auto");
+    // agent CLI expects `auto`, not `cursor-auto`.
+    cmd.env("ANTHROPIC_MODEL", "auto");
     cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+
+    // Claude Code merges ~/.claude/settings.json `env` and can override process
+    // env (e.g. a custom DeepSeek base URL). Force the local proxy via --settings.
+    let user_passed_settings = claude_args.iter().any(|a| {
+        *a == "--settings" || a.starts_with("--settings=")
+    });
+    if !user_passed_settings {
+        let bridge_settings = format!(
+            concat!(
+                r#"{{"env":{{"ANTHROPIC_BASE_URL":"{}","ANTHROPIC_AUTH_TOKEN":"sk-any","#,
+                r#""ANTHROPIC_API_KEY":"","ANTHROPIC_MODEL":"auto"}},"model":"auto"}}"#
+            ),
+            base_url
+        );
+        cmd.arg("--settings").arg(bridge_settings);
+    }
 
     for arg in &claude_args { cmd.arg(arg); }
     cmd.stdin(Stdio::inherit());
@@ -196,15 +214,12 @@ fn respond_models(mut s: TcpStream) {
 
 fn get_models_json() -> String {
     r#"{"data":[
+        {"type":"model","id":"auto","display_name":"Auto"},
         {"type":"model","id":"default","display_name":"Auto"},
-        {"type":"model","id":"claude-sonnet-4-6-high","display_name":"Claude Sonnet 4.6 High"},
-        {"type":"model","id":"claude-sonnet-4-6-high-fast","display_name":"Claude Sonnet 4.6 High Fast"},
-        {"type":"model","id":"claude-opus-5-high","display_name":"Claude Opus 5 High"},
-        {"type":"model","id":"claude-opus-5-high-fast","display_name":"Claude Opus 5 High Fast"},
-        {"type":"model","id":"cursor-grok-4.5-high","display_name":"Cursor Grok 4.5"},
-        {"type":"model","id":"cursor-grok-4.5-high-fast","display_name":"Cursor Grok 4.5 Fast"},
         {"type":"model","id":"composer-2.5","display_name":"Composer 2.5"},
-        {"type":"model","id":"composer-2.5-fast","display_name":"Composer 2.5 Fast"}
+        {"type":"model","id":"composer-2.5-fast","display_name":"Composer 2.5 Fast"},
+        {"type":"model","id":"cursor-grok-4.5-high","display_name":"Cursor Grok 4.5"},
+        {"type":"model","id":"cursor-grok-4.5-high-fast","display_name":"Cursor Grok 4.5 Fast"}
     ]}"#.to_string()
 }
 
@@ -499,12 +514,24 @@ impl TextStream {
     }
 }
 
+fn map_agent_model(requested: &str) -> &str {
+    match requested {
+        "cursor-auto" | "default" | "claude-auto" => "auto",
+        other => other,
+    }
+}
+
 fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<std::process::Child> {
     let path = find_agent().unwrap_or_else(|| { log("agent not found. Install Cursor CLI or set AGENT_PATH."); std::process::exit(1); });
-    log(&format!("spawning: {path}"));
+    let model = map_agent_model(requested_model);
+    log(&format!("spawning: {path} (model={model})"));
 
-    // Run agent in temp dir so it can't touch project files
-    let sandbox = std::env::temp_dir().join(format!("cursor-bridge-{}", std::process::id()));
+    // Prefer a stable sandbox parent; inherited TMPDIR can point at a deleted dir.
+    let tmp = std::env::var_os("TMPDIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let sandbox = tmp.join(format!("cursor-bridge-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&sandbox);
     log(&format!("sandbox: {}", sandbox.display()));
 
@@ -513,7 +540,7 @@ fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<s
     // --trust skips workspace trust prompt.
     let mut cmd = Command::new(path);
     cmd.args(["--print", "--force", "--output-format", "stream-json", "--stream-partial-output",
-              "--model", requested_model, "--trust"]);
+              "--model", model, "--trust"]);
     if let Some(chat_id) = resume {
         log(&format!("resuming session {chat_id}"));
         cmd.args(["--resume", chat_id]);
@@ -538,7 +565,7 @@ fn write_prompt(agent: &mut std::process::Child, prompt: &str) {
 
 fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
     let messages = req.messages.as_deref().unwrap_or_default();
-    let model = req.model.as_deref().unwrap_or("cursor-auto");
+    let model = req.model.as_deref().unwrap_or("auto");
     let (resume, prompt) = match plan_turn(&sessions().lock().unwrap(), messages, &req.system, model) {
         TurnPlan::Fresh { prompt } => (None, prompt),
         TurnPlan::Resume { chat_id, prompt } => (Some(chat_id), prompt),
@@ -629,7 +656,7 @@ fn emit_text(stream: &mut TcpStream, text: &str, index: i32, block_open: &mut bo
 
 fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let messages = req.messages.as_deref().unwrap_or_default();
-    let model = req.model.as_deref().unwrap_or("cursor-auto");
+    let model = req.model.as_deref().unwrap_or("auto");
     let (resume, prompt) = match plan_turn(&sessions().lock().unwrap(), messages, &req.system, model) {
         TurnPlan::Fresh { prompt } => (None, prompt),
         TurnPlan::Resume { chat_id, prompt } => (Some(chat_id), prompt),

@@ -17,6 +17,38 @@ fn log(msg: &str) {
     }
 }
 
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).map_or(false, |v| !v.is_empty() && v != "0")
+}
+
+/// Dump the prompt we send to Cursor `agent` (not Cursor's private server system prompt).
+fn dump_outbound_prompt(model: &str, resume: Option<&str>, prompt: &str) {
+    if !env_flag("CURSOR_BRIDGE_DUMP_PROMPTS") {
+        return;
+    }
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = home.join(".cursor-bridge").join("prompts");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("{ts}-{}.txt", std::process::id()));
+    let header = format!(
+        "model={model}\nresume={}\nbytes={}\n----\n",
+        resume.unwrap_or("-"),
+        prompt.len()
+    );
+    if std::fs::write(&path, format!("{header}{prompt}")).is_ok() {
+        eprintln!("bridge: dumped prompt → {}", path.display());
+        log(&format!("dumped prompt → {}", path.display()));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let claude_args: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
@@ -28,6 +60,11 @@ fn main() {
         println!("  cursor-bridge              interactive");
         println!("  cursor-bridge \"prompt\"     one-shot");
         println!("  cursor-bridge -p \"prompt\"  pipe mode");
+        println!();
+        println!("Env:");
+        println!("  CURSOR_BRIDGE_DEBUG=1          verbose bridge logs on stderr");
+        println!("  CURSOR_BRIDGE_DUMP_PROMPTS=1   save each agent prompt under");
+        println!("                                 ~/.cursor-bridge/prompts/");
         return;
     }
 
@@ -661,7 +698,8 @@ fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<s
         .spawn()
 }
 
-fn write_prompt(agent: &mut std::process::Child, prompt: &str) {
+fn write_prompt(agent: &mut std::process::Child, model: &str, resume: Option<&str>, prompt: &str) {
+    dump_outbound_prompt(model, resume, prompt);
     if let Some(ref mut stdin) = agent.stdin {
         let _ = stdin.write_all(prompt.as_bytes());
         let _ = stdin.flush();
@@ -685,7 +723,7 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
         let _ = stream.write_all(format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len()).as_bytes());
         return;
     }};
-    write_prompt(&mut agent, &prompt);
+    write_prompt(&mut agent, model, resume.as_deref(), &prompt);
 
     let reader = BufReader::new(agent.stdout.take().unwrap());
     let mut text = String::new();
@@ -777,7 +815,7 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
         return;
     }};
     log(&format!("prompt: {}b", prompt.len()));
-    write_prompt(&mut agent, &prompt);
+    write_prompt(&mut agent, model, resume.as_deref(), &prompt);
 
     // SSE response headers
     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n");

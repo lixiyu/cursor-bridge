@@ -143,6 +143,10 @@ impl Proxy {
                 if sd.load(Ordering::Relaxed) { break; }
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // Listener is nonblocking for accept(); accepted sockets
+                        // inherit that on macOS and then large POSTs fail with
+                        // EAGAIN (os error 35) mid-body. Force blocking reads.
+                        let _ = stream.set_nonblocking(false);
                         let ct = t.clone();
                         std::thread::Builder::new().name("bridge-conn".into())
                             .spawn(move || handle_connection(stream, &ct)).ok();
@@ -175,7 +179,14 @@ fn read_exact_bytes<R: Read>(reader: &mut R, len: usize) -> std::io::Result<Vec<
                 ));
             }
             Ok(n) => got += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // WouldBlock/EAGAIN can still appear briefly; wait and retry.
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::Interrupted
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
             Err(e) => return Err(e),
         }
     }

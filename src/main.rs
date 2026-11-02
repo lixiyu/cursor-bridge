@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+static BRIDGE_CONFIG: OnceLock<BridgeConfig> = OnceLock::new();
+
 fn log(msg: &str) {
     if std::env::var("CURSOR_BRIDGE_DEBUG").is_ok() {
         eprintln!("bridge: {msg}");
@@ -21,31 +23,128 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).map_or(false, |v| !v.is_empty() && v != "0")
 }
 
-/// Dump the prompt we send to Cursor `agent` (not Cursor's private server system prompt).
-fn dump_outbound_prompt(model: &str, resume: Option<&str>, prompt: &str) {
-    if !env_flag("CURSOR_BRIDGE_DUMP_PROMPTS") {
-        return;
-    }
-    let home = std::env::var_os("HOME")
+fn home_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let dir = home.join(".cursor-bridge").join("prompts");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+#[derive(Clone, Default, serde::Deserialize)]
+struct BridgeConfig {
+    /// Directory for Claude Code request / agent prompt dumps.
+    /// Keep the real path in a local config file — never commit machine paths.
+    #[serde(default)]
+    prompts_dir: Option<String>,
+}
+
+fn expand_user_path(raw: &str) -> std::path::PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home_dir().join(rest);
     }
-    let ts = std::time::SystemTime::now()
+    if raw == "~" {
+        return home_dir();
+    }
+    std::path::PathBuf::from(raw)
+}
+
+fn read_bridge_config_file(path: &std::path::Path) -> Option<BridgeConfig> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Load optional local config. Search order (first wins for each field via merge):
+/// 1) `$CURSOR_BRIDGE_CONFIG`
+/// 2) `./cursor-bridge.local.json` (gitignored project-local)
+/// 3) `~/.cursor-bridge/config.json` (user-local, outside the repo)
+fn load_bridge_config() -> BridgeConfig {
+    let mut cfg = BridgeConfig::default();
+    let mut paths = Vec::new();
+    if let Ok(p) = std::env::var("CURSOR_BRIDGE_CONFIG") {
+        if !p.is_empty() {
+            paths.push(std::path::PathBuf::from(p));
+        }
+    }
+    paths.push(std::path::PathBuf::from("cursor-bridge.local.json"));
+    paths.push(home_dir().join(".cursor-bridge").join("config.json"));
+
+    for path in paths {
+        if let Some(file_cfg) = read_bridge_config_file(&path) {
+            if cfg.prompts_dir.is_none() {
+                cfg.prompts_dir = file_cfg.prompts_dir;
+            }
+            log(&format!("config loaded: {}", path.display()));
+        }
+    }
+    if let Ok(dir) = std::env::var("CURSOR_BRIDGE_PROMPTS_DIR") {
+        if !dir.is_empty() {
+            cfg.prompts_dir = Some(dir);
+        }
+    }
+    cfg
+}
+
+fn prompts_dir_from_config(cfg: &BridgeConfig) -> Option<std::path::PathBuf> {
+    cfg.prompts_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(expand_user_path)
+}
+
+fn resolve_prompts_dir(cfg: &BridgeConfig) -> Option<std::path::PathBuf> {
+    prompts_dir_from_config(cfg).or_else(|| {
+        if env_flag("CURSOR_BRIDGE_DUMP_PROMPTS") {
+            Some(home_dir().join(".cursor-bridge").join("prompts"))
+        } else {
+            None
+        }
+    })
+}
+
+fn dump_stamp() -> u128 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = dir.join(format!("{ts}-{}.txt", std::process::id()));
+        .unwrap_or(0)
+}
+
+/// What Claude Code actually sent us on POST /v1/messages (system / messages / tools…).
+fn dump_claude_request(cfg: &BridgeConfig, body: &[u8]) {
+    let Some(dir) = resolve_prompts_dir(cfg) else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("bridge: failed to create prompts_dir {}", dir.display());
+        return;
+    }
+    let path = dir.join(format!("{}-{}-claude-request.json", dump_stamp(), std::process::id()));
+    // Prefer pretty JSON when parseable; otherwise raw bytes as lossy text.
+    let contents = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    if std::fs::write(&path, contents).is_ok() {
+        log(&format!("dumped Claude request → {}", path.display()));
+    } else {
+        eprintln!("bridge: failed to write {}", path.display());
+    }
+}
+
+/// Text we forward to local `agent` after translating Claude's request.
+fn dump_outbound_prompt(cfg: &BridgeConfig, model: &str, resume: Option<&str>, prompt: &str) {
+    let Some(dir) = resolve_prompts_dir(cfg) else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("bridge: failed to create prompts_dir {}", dir.display());
+        return;
+    }
+    let path = dir.join(format!("{}-{}-agent-prompt.txt", dump_stamp(), std::process::id()));
     let header = format!(
         "model={model}\nresume={}\nbytes={}\n----\n",
         resume.unwrap_or("-"),
         prompt.len()
     );
     if std::fs::write(&path, format!("{header}{prompt}")).is_ok() {
-        eprintln!("bridge: dumped prompt → {}", path.display());
-        log(&format!("dumped prompt → {}", path.display()));
+        log(&format!("dumped agent prompt → {}", path.display()));
+    } else {
+        eprintln!("bridge: failed to write {}", path.display());
     }
 }
 
@@ -61,12 +160,23 @@ fn main() {
         println!("  cursor-bridge \"prompt\"     one-shot");
         println!("  cursor-bridge -p \"prompt\"  pipe mode");
         println!();
+        println!("Config (optional JSON):");
+        println!("  ./cursor-bridge.local.json     project-local (gitignored)");
+        println!("  ~/.cursor-bridge/config.json   user-local");
+        println!("  keys: {{ \"prompts_dir\": \"/path/to/dir\" }}");
+        println!();
         println!("Env:");
-        println!("  CURSOR_BRIDGE_DEBUG=1          verbose bridge logs on stderr");
-        println!("  CURSOR_BRIDGE_DUMP_PROMPTS=1   save each agent prompt under");
-        println!("                                 ~/.cursor-bridge/prompts/");
+        println!("  CURSOR_BRIDGE_DEBUG=1            verbose bridge logs on stderr");
+        println!("  CURSOR_BRIDGE_PROMPTS_DIR=/path  override prompts_dir");
+        println!("  CURSOR_BRIDGE_DUMP_PROMPTS=1     dump to ~/.cursor-bridge/prompts");
+        println!("                                   if prompts_dir is unset");
+        println!("  CURSOR_BRIDGE_CONFIG=/file.json  explicit config path");
         return;
     }
+
+    let bridge_cfg = load_bridge_config();
+    // Share with request handlers without plumbing through every call site.
+    let _ = BRIDGE_CONFIG.set(bridge_cfg);
 
     let token = get_cursor_token();
     if token.is_empty() {
@@ -699,7 +809,8 @@ fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<s
 }
 
 fn write_prompt(agent: &mut std::process::Child, model: &str, resume: Option<&str>, prompt: &str) {
-    dump_outbound_prompt(model, resume, prompt);
+    let cfg = BRIDGE_CONFIG.get().cloned().unwrap_or_default();
+    dump_outbound_prompt(&cfg, model, resume, prompt);
     if let Some(ref mut stdin) = agent.stdin {
         let _ = stdin.write_all(prompt.as_bytes());
         let _ = stdin.flush();
@@ -980,21 +1091,28 @@ fn escape_json_string_controls(input: &[u8]) -> Vec<u8> {
 }
 
 fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
-    let req: MessagesRequest = match serde_json::from_slice(body)
-        .or_else(|e| {
+    let cfg = BRIDGE_CONFIG.get().cloned().unwrap_or_default();
+
+    let (req, dump_bytes) = match serde_json::from_slice::<MessagesRequest>(body) {
+        Ok(r) => (r, body.to_vec()),
+        Err(e) => {
             log(&format!("json parse retry after control-char sanitize: {e}"));
             let cleaned = escape_json_string_controls(body);
-            serde_json::from_slice(&cleaned)
-        }) {
-        Ok(r) => r,
-        Err(e) => {
-            let err = format!("{{\"error\":\"{}\"}}", e.to_string().replace('"', "'"));
-            let resp = format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len());
-            let _ = stream.write_all(resp.as_bytes());
-            let _ = stream.flush();
-            return;
+            match serde_json::from_slice::<MessagesRequest>(&cleaned) {
+                Ok(r) => (r, cleaned),
+                Err(e2) => {
+                    let err = format!("{{\"error\":\"{}\"}}", e2.to_string().replace('"', "'"));
+                    let resp = format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len());
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                    return;
+                }
+            }
         }
     };
+
+    // Claude Code's /v1/messages body — system reminders, tools, history, images…
+    dump_claude_request(&cfg, &dump_bytes);
 
     if req.stream.unwrap_or(true) { handle_streaming(stream, &req); }
     else { handle_blocking(stream, &req); }

@@ -2,3 +2,7 @@
 .DS_Store
 demo.gif
 *.gif
+
+# Machine-local paths (prompts_dir, etc.) — never commit
+cursor-bridge.local.json
+.cursor-bridge.local.json

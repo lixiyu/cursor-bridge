@@ -163,8 +163,75 @@ impl Proxy {
 
 // ─── HTTP ─────────────────────────────────────────────────────
 
+fn read_exact_bytes<R: Read>(reader: &mut R, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut body = vec![0u8; len];
+    let mut got = 0usize;
+    while got < len {
+        match reader.read(&mut body[got..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("body truncated: got {got}/{len}"),
+                ));
+            }
+            Ok(n) => got += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(body)
+}
+
+fn read_chunked_body<R: BufRead>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "chunked body ended early",
+            ));
+        }
+        // Chunk size — strip extensions after ';'
+        let size_str = line.split(';').next().unwrap_or("").trim();
+        let sz = usize::from_str_radix(size_str, 16).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad chunk size: {e}"))
+        })?;
+        if sz == 0 {
+            // Consume trailing headers after the terminating chunk, if any.
+            loop {
+                let mut trailer = String::new();
+                if reader.read_line(&mut trailer)? == 0 || trailer == "\r\n" || trailer == "\n" {
+                    break;
+                }
+            }
+            break;
+        }
+        let chunk = read_exact_bytes(reader, sz)?;
+        body.extend_from_slice(&chunk);
+        let mut crlf = String::new();
+        let _ = reader.read_line(&mut crlf)?;
+    }
+    Ok(body)
+}
+
+fn respond_body_read_error(mut stream: TcpStream, err: &std::io::Error) {
+    let msg = format!("failed to read request body: {err}").replace('"', "'");
+    let err_body = format!(r#"{{"error":"{msg}"}}"#);
+    let resp = format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err_body}",
+        err_body.len()
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
 fn handle_connection(stream: TcpStream, token: &str) {
-    let mut reader = BufReader::new(&stream);
+    // Large image payloads can take a while to land on localhost.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(300)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(300)));
+
+    let mut reader = BufReader::with_capacity(256 * 1024, &stream);
     let mut req_line = String::new();
     if reader.read_line(&mut req_line).ok().map_or(true, |n| n == 0) || req_line.trim().is_empty() {
         return;
@@ -172,8 +239,8 @@ fn handle_connection(stream: TcpStream, token: &str) {
 
     let parts: Vec<&str> = req_line.trim().splitn(3, ' ').collect();
     if parts.len() < 2 { return; }
-    let method = parts[0];
-    let path = parts[1];
+    let method = parts[0].to_string();
+    let path = parts[1].to_string();
 
     let mut content_length: usize = 0;
     let mut is_chunked = false;
@@ -189,28 +256,31 @@ fn handle_connection(stream: TcpStream, token: &str) {
         }
     }
 
-    let mut body = Vec::new();
-    if content_length > 0 {
-        body.resize(content_length, 0);
-        let _ = reader.read_exact(&mut body);
-    } else if is_chunked {
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).ok().map_or(true, |n| n == 0) { break; }
-            // Chunk size — strip extensions after ';'
-            let size_str = line.split(';').next().unwrap_or("").trim();
-            let sz = usize::from_str_radix(size_str, 16).unwrap_or(0);
-            if sz == 0 { break; }
-            let mut chunk = vec![0u8; sz];
-            let _ = reader.read_exact(&mut chunk);
-            body.extend_from_slice(&chunk);
-            let _ = reader.read_line(&mut String::new());
+    let body = if content_length > 0 {
+        match read_exact_bytes(&mut reader, content_length) {
+            Ok(b) => b,
+            Err(e) => {
+                log(&format!("  {} {} body read failed: {e}", method, path));
+                respond_body_read_error(stream, &e);
+                return;
+            }
         }
-    }
+    } else if is_chunked {
+        match read_chunked_body(&mut reader) {
+            Ok(b) => b,
+            Err(e) => {
+                log(&format!("  {} {} chunked body failed: {e}", method, path));
+                respond_body_read_error(stream, &e);
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     log(&format!("  {} {} ({}b)", method, path, body.len()));
 
-    match (method, path) {
+    match (method.as_str(), path.as_str()) {
         ("HEAD", "/api/hello") | ("GET", "/api/hello") => respond_hello(stream, method == "HEAD"),
         ("GET", "/v1/models") | ("GET", "/models") => respond_models(stream),
         ("POST", p) if p.starts_with("/v1/messages") || p.starts_with("/messages") =>
@@ -913,6 +983,14 @@ mod tests {
         let cleaned = escape_json_string_controls(bad);
         let req: MessagesRequest = serde_json::from_slice(&cleaned).expect("cleaned json");
         assert_eq!(req.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn test_read_exact_bytes_reports_truncation() {
+        let mut cursor = std::io::Cursor::new(b"short");
+        let err = read_exact_bytes(&mut cursor, 20).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("got 5/20"));
     }
 
     #[test]
